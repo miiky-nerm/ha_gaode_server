@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 import logging
-import aiohttp
-from .cache import get_cache, set_cache
 from homeassistant.components.http import HomeAssistantView
 
 from aiohttp import web
 import json
+from json import JSONDecodeError
 import os
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -85,6 +84,37 @@ class DxZoneView(HomeAssistantView):
         config_dir = hass.config.path()
         self.absolute_file_name = os.path.join(config_dir, DEFAULT_ZONE_STORE_NAME)
 
+    def _load_saved_data_sync(self):
+        """Load saved zone data from disk."""
+        if not os.path.exists(self.absolute_file_name):
+            return {}
+
+        try:
+            with open(self.absolute_file_name, "r", encoding="utf-8") as file:
+                save_data = json.load(file)
+                return save_data or {}
+        except JSONDecodeError:
+            _LOGGER.warning(
+                "Zone store file %s is empty or invalid JSON, ignoring it",
+                self.absolute_file_name,
+            )
+            return {}
+
+    def _write_saved_data_sync(self, save_data):
+        """Write saved zone data to disk."""
+        tmp_file_name = f"{self.absolute_file_name}.tmp"
+        with open(tmp_file_name, "w", encoding="utf-8") as file:
+            json.dump(save_data, file)
+        os.replace(tmp_file_name, self.absolute_file_name)
+
+    async def _async_load_saved_data(self):
+        return await self.hass.async_add_executor_job(self._load_saved_data_sync)
+
+    async def _async_write_saved_data(self, save_data):
+        return await self.hass.async_add_executor_job(
+            self._write_saved_data_sync, save_data
+        )
+
     async def post(self, request):
         """Handle POST request"""
         resp_json = await request.json()
@@ -95,28 +125,19 @@ class DxZoneView(HomeAssistantView):
 
     async def get_by_entity_id_in_file(self, entity_id):
         """get saved data by entity_id"""
-        if os.path.exists(self.absolute_file_name):
-            with open(self.absolute_file_name, "r", encoding="utf-8") as file:
-                save_data = json.load(file)
-                return_data = save_data.get(entity_id)
-                return return_data
+        save_data = await self._async_load_saved_data()
+        return save_data.get(entity_id)
 
     async def save(self, data):
         """To save zone entity"""
         hass = self.hass
-        save_data = {}
         entity_id = data.get(ATTR_ENTITY_ID)
         zone = hass.states.get(entity_id)
 
-        if os.path.exists(self.absolute_file_name):
-            with open(self.absolute_file_name, "r", encoding="utf-8") as file:
-                save_data = json.load(file)
-                if save_data is None:
-                    save_data = {}
+        save_data = await self._async_load_saved_data()
         if zone is not None:
             save_data[entity_id] = data
-            with open(file=self.absolute_file_name, mode="w", encoding="utf-8") as file:
-                json.dump(save_data, file)
+            await self._async_write_saved_data(save_data)
             clone_attributes = dict(zone.attributes)
             clone_attributes.update(data)
             self.hass.states.async_set(entity_id, zone.state, clone_attributes)
@@ -124,23 +145,20 @@ class DxZoneView(HomeAssistantView):
     async def load_all(self, event):
         """Load data from file and delete data if not exists"""
         hass = self.hass
-        if os.path.exists(self.absolute_file_name):
-            new_save_data = {}
-            with open(self.absolute_file_name, "r", encoding="utf-8") as file:
-                save_data = json.load(file)
-            if save_data is not None:
-                zone_list = hass.states.async_all([CONF_ZONE])
-                if len(zone_list) > 0:
-                    for zone in zone_list:
-                        attributes = zone.attributes
-                        entity_id = zone.entity_id
-                        if entity_id in save_data:
-                            clone_attributes = dict(attributes)
-                            now_data = save_data[entity_id]
-                            clone_attributes.update(now_data)
-                            new_save_data[entity_id] = now_data
-                            self.hass.states.async_set(entity_id, 0, clone_attributes)
-                    with open(
-                        file=self.absolute_file_name, mode="w", encoding="utf-8"
-                    ) as file:
-                        json.dump(new_save_data, file)
+        save_data = await self._async_load_saved_data()
+        if not save_data:
+            return
+
+        new_save_data = {}
+        zone_list = hass.states.async_all([CONF_ZONE])
+        if len(zone_list) > 0:
+            for zone in zone_list:
+                attributes = zone.attributes
+                entity_id = zone.entity_id
+                if entity_id in save_data:
+                    clone_attributes = dict(attributes)
+                    now_data = save_data[entity_id]
+                    clone_attributes.update(now_data)
+                    new_save_data[entity_id] = now_data
+                    self.hass.states.async_set(entity_id, 0, clone_attributes)
+            await self._async_write_saved_data(new_save_data)
