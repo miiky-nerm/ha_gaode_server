@@ -1,5 +1,5 @@
 import sqlite3
-
+import aiosqlite
 import logging
 from .dx_exception import DbException
 
@@ -11,13 +11,15 @@ class DxDb:
     Handle Db Class
     """
 
-    connection = None
-
     def __init__(self, url) -> None:
-        conn = sqlite3.connect(url)
+        self.db_path = url
+        self.connection = sqlite3.connect(url, check_same_thread=False)
         _LOGGER.debug("DxDb Init")
-        self.connection = conn
+        # self.connection = conn
         self._init_table()
+
+    def _get_conn(self):
+        return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _init_table(self):
         conn = self.connection
@@ -38,11 +40,14 @@ class DxDb:
            dx_record_datetime INTEGER not null
            );"""
             )
-            cursor.close()
             conn.commit()
+            if cursor: 
+                cursor.close()
         except Exception as e:
-            cursor.close()
-            conn.rollback()
+            if cursor: 
+                cursor.close()
+            if conn: 
+                conn.rollback()
             raise DbException("初始化table错误: %s", str(e))
 
     def search(self, sql: str, *args):
@@ -53,8 +58,8 @@ class DxDb:
             sql (str): Sql
             args: Sql Paramters
         """
-        conn = self.connection
         try:
+            conn = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(sql, args)
             rows = cursor.fetchall()
@@ -67,6 +72,7 @@ class DxDb:
                     return_row[column_name] = value
                 return_rows.append(return_row)
             cursor.close()
+            conn.close()
             return return_rows
         except Exception as e:
             raise DbException("Search 错误: %s", str(e))
@@ -79,11 +85,13 @@ class DxDb:
             sql (str): Sql
             args: Sql Paramters
         """
-        conn = self.connection
         try:
+            conn = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(sql, args)
-            cursor.close()
             conn.commit()
+            if cursor: 
+                cursor.close()
+            conn.close()
         except Exception as e:
             raise DbException("Insert 错误: " + str(e))
