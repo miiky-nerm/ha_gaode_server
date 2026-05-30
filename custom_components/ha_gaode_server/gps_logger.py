@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import logging
-import aiohttp
 from aiohttp import ClientSession
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -18,7 +17,9 @@ from homeassistant.const import (
     CONF_RADIUS,
     CONF_ZONE,
 )
-from homeassistant.core import HomeAssistant, Config
+from homeassistant.core import HomeAssistant
+from typing import Any
+
 from .db import DxDb
 from .const import (
     CUSTOM_ATTR_DX_RECORD_DATETIME,
@@ -48,7 +49,7 @@ class DxGpsLogger:
     ignore_distance_device_trackers = None
     push_device_trackers_post = None
 
-    def __init__(self, hass: HomeAssistant, config: Config) -> None:
+    def __init__(self, hass: HomeAssistant, config: dict[str, Any]) -> None:
         self.hass = hass
         self.gaode_server_key = config.get("gaode_server_key")
         self.change_gpslogger_state = config.get("change_gpslogger_state")
@@ -196,7 +197,8 @@ class DxGpsLogger:
                     self.gps_obj_dict[entity_id] = gps_obj_list
                 if self.db_instance is not None:
                     # 插入数据库
-                    self.db_instance.insert(
+                    await self.hass.async_add_executor_job(
+                        self.db_instance.insert,
                         """
             INSERT INTO gps_logger_history (entity_id, longitude, latitude, gcj02_longitude, gcj02_latitude, dx_state, dx_pre_state, dx_distance, dx_record_datetime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
@@ -266,7 +268,7 @@ class DxGpsLogger:
 
         parse_locations = None
         try:
-            session = aiohttp.ClientSession()
+            session = async_get_clientsession(self.hass)
             async with session.get(
                 "https://restapi.amap.com/v3/assistant/coordinate/convert?"
                 + "key="
@@ -293,8 +295,6 @@ class DxGpsLogger:
         except Exception as e:
             _LOGGER.error(str(e))
             raise GaoDeException("高德地图地址转换错误: %s", str(e))
-        finally:
-            await session.close()
         # 获取到的经纬度
         parse_locations_arr = parse_locations.split(",")
         parse_longitude = str(round(float(parse_locations_arr[0]), 6))
@@ -399,7 +399,7 @@ class DxGpsLogger:
 
         destination = gcj02_longitude + "," + gcj02_latitude
         try:
-            session = aiohttp.ClientSession()
+            session = async_get_clientsession(self.hass)
             async with session.get(
                 "https://restapi.amap.com/v3/distance?"
                 + "key="
@@ -461,8 +461,6 @@ class DxGpsLogger:
         except Exception as e:
             _LOGGER.error("高德地图距离计算错误: %s", str(e))
             raise GaoDeException("高德地图距离计算错误: " + str(e))
-        finally:
-            await session.close()
         if return_value is not None:
             return return_value
         else:
@@ -502,8 +500,10 @@ class DxGpsLoggerSearchView(HomeAssistantView):
     url = "/api/dx/gps/gps_list_from_db"
     name = "search gps_list in db"
     db_instance = None
+    hass = None
 
-    def __init__(self, db_instance: DxDb) -> None:
+    def __init__(self, hass: HomeAssistant, db_instance: DxDb) -> None:
+        self.hass = hass
         self.db_instance = db_instance
 
     async def get(self, request):
@@ -513,10 +513,16 @@ class DxGpsLoggerSearchView(HomeAssistantView):
         entity_id = request.query.get(ATTR_ENTITY_ID)
         start_time_seconds = request.query.get("start_time_seconds")
         end_time_seconds = request.query.get("end_time_seconds")
+        try:
+            start_time_seconds = int(start_time_seconds)
+            end_time_seconds = int(end_time_seconds)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid time range"}, status=400)
 
-        rows = self.db_instance.search(
+        rows = await self.hass.async_add_executor_job(
+            self.db_instance.search,
             """
-            select entity_id, gcj02_longitude, gcj02_latitude, dx_record_datetime from gps_logger_history where entity_id = ? and dx_record_datetime > ? and dx_record_datetime < ? order by dx_record_datetime asc
+            select entity_id, gcj02_longitude, gcj02_latitude, dx_record_datetime from gps_logger_history where entity_id = ? and dx_record_datetime >= ? and dx_record_datetime <= ? order by dx_record_datetime asc
         """,
             entity_id,
             start_time_seconds,
