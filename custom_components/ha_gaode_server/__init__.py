@@ -3,18 +3,17 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import timedelta
+import asyncio
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.event import (
-    async_track_time_interval,
-)
-from datetime import datetime, timedelta
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.const import (
     EVENT_STATE_CHANGED,
-    EVENT_COMPONENT_LOADED,
     EVENT_HOMEASSISTANT_STARTED,
     ATTR_ENTITY_ID,
 )
-from homeassistant.core import HomeAssistant, Config
+from homeassistant.core import HomeAssistant
 
 from .dx_exception import ConfigException
 from .gps_logger import DxGpsLogger, DxGpsLoggerCacheView, DxGpsLoggerSearchView
@@ -35,22 +34,24 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-def handle_config(hass: HomeAssistant, config: Config):
+async def async_handle_config(hass: HomeAssistant, config):
     """
-    Handle hass config
+    Async handle hass config
     """
     config_entries = hass.config_entries
     entries = config_entries.async_entries(DOMAIN)
     entry_config = None
     if len(entries) > 0:
         entry_config = entries[0].data
+    
     config_dir = hass.config.path()
     gaode_server_key = None
     change_gpslogger_state = None
     db_url = None
     ignore_transform_device_trackers = None
-    ignore_device_trackers = None
+    ignore_distance_device_trackers = None
     push_device_trackers_post = None
+    
     if entry_config is not None:
         gaode_server_key = entry_config.get(CONFIG_GAODE_SERVER_KEY)
         change_gpslogger_state = entry_config.get(CONFIG_CHANGE_GPSLOGGER_STATE)
@@ -59,9 +60,11 @@ def handle_config(hass: HomeAssistant, config: Config):
         ha_gaode_server = config.get(DOMAIN)
         if ha_gaode_server is None:
             raise ConfigException("未配置ha_gaode_server节点")
+        
         gaode_server_key = ha_gaode_server.get(CONFIG_GAODE_SERVER_KEY)
         if gaode_server_key is None:
             raise ConfigException("未配置高德地图key")
+        
         change_gpslogger_state = ha_gaode_server.get(CONFIG_CHANGE_GPSLOGGER_STATE)
         push_device_trackers_post = ha_gaode_server.get(
             CONFIG_PUSH_DEVICE_TRACKERS_POST
@@ -72,13 +75,18 @@ def handle_config(hass: HomeAssistant, config: Config):
         ignore_distance_device_trackers = ha_gaode_server.get(
             CONFIG_IGNORE_DISTANCE_DEVICE_TRACKERS
         )
+        
         if change_gpslogger_state is None:
             change_gpslogger_state = True
+        
         db_url = ha_gaode_server.get(CONFIG_DB_URL)
         if db_url is None:
             db_url = DEFAULT_DB_NAME
 
-    db_url = os.path.join(config_dir, db_url)
+    db_url = await hass.async_add_executor_job(
+        os.path.join, config_dir, db_url
+    )
+    
     return {
         CONFIG_GAODE_SERVER_KEY: gaode_server_key,
         CONFIG_CHANGE_GPSLOGGER_STATE: change_gpslogger_state,
@@ -90,28 +98,26 @@ def handle_config(hass: HomeAssistant, config: Config):
 
 
 async def async_setup_entry(hass: HomeAssistant, config: ConfigEntry) -> bool:
-    """Set up ikuai from a config entry."""
+    """Set up ha_gaode_server from a config entry."""
     return True
 
 
-def async_setup(hass: HomeAssistant, config: Config) -> bool:
+async def async_setup(hass: HomeAssistant, config) -> bool:
     """
-    Hass entry
+    Async Hass entry
     """
     _LOGGER.debug("Async_setup")
 
-    dx_config = handle_config(hass, config)
-    (
-        gaode_server_key,
-        change_gpslogger_state,
-        db_url,
-        ignore_transform_device_trackers,
-        ignore_distance_device_trackers,
-        push_device_trackers_post,
-    ) = dx_config.values()
+    dx_config = await async_handle_config(hass, config)
+    
+    gaode_server_key = dx_config.get(CONFIG_GAODE_SERVER_KEY)
+    change_gpslogger_state = dx_config.get(CONFIG_CHANGE_GPSLOGGER_STATE)
+    db_url = dx_config.get(CONFIG_DB_URL)
+    ignore_transform_device_trackers = dx_config.get(CONFIG_IGNORE_TRANSFORM_DEVICE_TRACKERS)
+    ignore_distance_device_trackers = dx_config.get(CONFIG_IGNORE_DISTANCE_DEVICE_TRACKERS)
+    push_device_trackers_post = dx_config.get(CONFIG_PUSH_DEVICE_TRACKERS_POST)
 
-    # 实例化数据库
-    db_instance = DxDb(db_url)
+    db_instance = await hass.async_add_executor_job(DxDb, db_url)
 
     gpslogger_instance = DxGpsLogger(
         hass,
@@ -124,20 +130,21 @@ def async_setup(hass: HomeAssistant, config: Config) -> bool:
             "push_device_trackers_post": push_device_trackers_post,
         },
     )
+    
     zone_view_instance = DxZoneView(hass)
     zone_instance = DxZone(hass, zone_view_instance)
     gpslogger_cache_view_instance = DxGpsLoggerCacheView(gpslogger_instance)
-    gpslogger_search_view_instance = DxGpsLoggerSearchView(db_instance)
+    gpslogger_search_view_instance = DxGpsLoggerSearchView(hass, db_instance)
 
-    async def handle_event(event):
+    async def async_handle_event(event):
         data = event.data
         entity_id = data.get(ATTR_ENTITY_ID)
-        if entity_id.startswith("zone."):
+        if entity_id and entity_id.startswith("zone."):
             await zone_instance.handle_zone_event(event)
-        elif entity_id.startswith("device_tracker."):
+        elif entity_id and entity_id.startswith("device_tracker."):
             await gpslogger_instance.handle_gps_event(event)
 
-    hass.bus.async_listen(EVENT_STATE_CHANGED, handle_event)
+    hass.bus.async_listen(EVENT_STATE_CHANGED, async_handle_event)
     hass.bus.async_listen(EVENT_HOMEASSISTANT_STARTED, zone_view_instance.load_all)
 
     hass.http.register_view(gpslogger_cache_view_instance)
@@ -149,3 +156,5 @@ def async_setup(hass: HomeAssistant, config: Config) -> bool:
         gpslogger_instance.clear_gps_obj_dict,
         timedelta(days=1),
     )
+    
+    return True
